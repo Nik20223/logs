@@ -16,19 +16,20 @@ from collections import Counter
 
 # Формат записи в логе:
 # %h - - %t "%r" %s %b "%{Referer}" "%{User-Agent}" %d
+# Любое из строковых полей (%r, Referer, User-Agent) может содержать
+# экранированные кавычки (например, при сканировании уязвимостей),
+# поэтому разбираются только нужные для статистики поля: IP и время
+# в начале строки, метод и URL — первые токены после открывающей
+# кавычки запроса, длительность — последнее число в строке.
 LOG_PATTERN = re.compile(
     r'^(?P<ip>\S+) \S+ \S+ '
     r'\[(?P<time>[^\]]+)\] '
-    r'"(?P<request>[^"]*)" '
-    r'(?P<status>\d{3}) '
-    r'(?P<size>\S+) '
-    r'"(?P<referer>[^"]*)" '
-    r'"(?P<user_agent>[^"]*)" '
-    r'(?P<duration>\d+)\s*$'
+    r'"(?P<method>[^ "]*)(?: (?P<url>[^ ]+))?'
+    r'.* (?P<duration>\d+)\s*$'
 )
 
 # HTTP-методы, статистика по которым обязательна в отчёте.
-HTTP_METHODS = ("GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD")
+HTTP_METHODS = ("GET", "POST", "HEAD", "PUT", "OPTIONS", "DELETE")
 
 # Сколько записей показывать в топах.
 TOP_IPS_LIMIT = 3
@@ -88,15 +89,14 @@ def analyze_file(file_path):
             data = match.groupdict()
             total_requests += 1
 
-            request_parts = data["request"].split()
-            method = request_parts[0] if request_parts else "-"
-            url = request_parts[1] if len(request_parts) > 1 else "-"
+            method = data["method"] or "-"
+            url = data["url"] or "-"
 
             methods[method] += 1
             ip_counter[data["ip"]] += 1
 
             duration = int(data["duration"])
-            entry = (duration, data["ip"], method, url, data["time"])
+            entry = (duration, data["ip"], method, url, f"[{data['time']}]")
             if len(slowest) < TOP_SLOW_LIMIT:
                 heapq.heappush(slowest, entry)
             elif duration > slowest[0][0]:
@@ -105,55 +105,50 @@ def analyze_file(file_path):
     slowest.sort(key=lambda entry: entry[0], reverse=True)
 
     return {
-        "file": os.path.abspath(file_path),
-        "total_requests": total_requests,
-        "methods": {method: methods[method] for method in HTTP_METHODS},
-        "top_ips": [
-            {"ip": ip, "requests": count}
-            for ip, count in ip_counter.most_common(TOP_IPS_LIMIT)
-        ],
-        "top_slowest_requests": [
+        "top_ips": dict(ip_counter.most_common(TOP_IPS_LIMIT)),
+        "top_longest": [
             {
+                "ip": ip,
+                "date": date,
                 "method": method,
                 "url": url,
-                "ip": ip,
-                "duration_ms": duration,
-                "time": time,
+                "duration": duration,
             }
-            for duration, ip, method, url, time in slowest
+            for duration, ip, method, url, date in slowest
         ],
+        "total_stat": {method: methods[method] for method in HTTP_METHODS},
+        "total_requests": total_requests,
     }
 
 
-def save_stats(stats, output_dir):
+def save_stats(stats, file_path, output_dir):
     """Сохранить статистику в json-файл и вернуть путь к нему."""
     os.makedirs(output_dir, exist_ok=True)
-    json_name = f"{os.path.basename(stats['file'])}.json"
-    json_path = os.path.join(output_dir, json_name)
+    json_path = os.path.join(output_dir, f"{os.path.basename(file_path)}.json")
     with open(json_path, "w", encoding="utf-8") as json_file:
-        json.dump(stats, json_file, ensure_ascii=False, indent=4, sort_keys=False)
+        json.dump(stats, json_file, ensure_ascii=False, indent=4)
     return json_path
 
 
-def print_stats(stats, json_path):
+def print_stats(stats, file_path, json_path):
     """Вывести статистику в терминал."""
     print("=" * 60)
-    print(f"Файл: {stats['file']}")
+    print(f"Файл: {os.path.abspath(file_path)}")
     print(f"Всего запросов: {stats['total_requests']}")
 
     print("Запросы по HTTP-методам:")
-    for method, count in stats["methods"].items():
+    for method, count in stats["total_stat"].items():
         print(f"    {method}: {count}")
 
     print("Топ-3 IP-адресов по количеству запросов:")
-    for index, item in enumerate(stats["top_ips"], start=1):
-        print(f"    {index}. {item['ip']} — {item['requests']} запросов")
+    for index, (ip, count) in enumerate(stats["top_ips"].items(), start=1):
+        print(f"    {index}. {ip} — {count} запросов")
 
     print("Топ-3 самых долгих запросов:")
-    for index, item in enumerate(stats["top_slowest_requests"], start=1):
+    for index, item in enumerate(stats["top_longest"], start=1):
         print(
             f"    {index}. {item['method']} {item['url']} "
-            f"IP: {item['ip']} {item['duration_ms']} мс [{item['time']}]"
+            f"IP: {item['ip']} {item['duration']} мс {item['date']}"
         )
 
     print(f"Результат сохранён в: {json_path}")
@@ -175,8 +170,8 @@ def main(argv=None):
 
     for file_path in log_files:
         stats = analyze_file(file_path)
-        json_path = save_stats(stats, args.output)
-        print_stats(stats, json_path)
+        json_path = save_stats(stats, file_path, args.output)
+        print_stats(stats, file_path, json_path)
 
     return 0
 
